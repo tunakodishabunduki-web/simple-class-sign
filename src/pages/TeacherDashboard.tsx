@@ -7,9 +7,11 @@ import {
   getRecordsForSession,
   type AttendanceSession,
 } from "@/lib/storage";
+import { exportSessionsToCSV } from "@/lib/csv";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { LogOut, Plus, Clock, Users, ChevronRight } from "lucide-react";
+import { LogOut, Plus, Clock, Users, ChevronRight, Download } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
 
 const formatTime = (ms: number) => {
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -24,13 +26,23 @@ const TeacherDashboard = () => {
   const [remaining, setRemaining] = useState(0);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [sessions, setSessions] = useState(getSessions());
+  const [liveCount, setLiveCount] = useState(0);
 
   const refresh = useCallback(() => {
     const a = getActiveSession();
     setActive(a);
     setSessions(getSessions());
-    if (a) setRemaining(a.expiresAt - Date.now());
+    if (a) {
+      setRemaining(a.expiresAt - Date.now());
+      setLiveCount(getRecordsForSession(a.id).length);
+    }
   }, []);
+
+  // Auto-refresh every 2 seconds for live counter + session list
+  useEffect(() => {
+    const interval = setInterval(refresh, 2000);
+    return () => clearInterval(interval);
+  }, [refresh]);
 
   useEffect(() => {
     if (!active) return;
@@ -42,6 +54,7 @@ const TeacherDashboard = () => {
         setSessions(getSessions());
       } else {
         setRemaining(r);
+        setLiveCount(getRecordsForSession(active.id).length);
       }
     }, 500);
     return () => clearInterval(interval);
@@ -52,6 +65,7 @@ const TeacherDashboard = () => {
     const s = createSession(user.id, minutes);
     setActive(s);
     setRemaining(s.expiresAt - Date.now());
+    setLiveCount(0);
     setSessions(getSessions());
   };
 
@@ -66,9 +80,19 @@ const TeacherDashboard = () => {
           <h1 className="text-lg font-bold">Teacher Dashboard</h1>
           <p className="text-xs text-muted-foreground">Hi, {user?.name}</p>
         </div>
-        <Button variant="ghost" size="icon" onClick={logout}>
-          <LogOut className="h-5 w-5" />
-        </Button>
+        <div className="flex gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => exportSessionsToCSV(sessions, getRecordsForSession)}
+            title="Export CSV"
+          >
+            <Download className="h-5 w-5" />
+          </Button>
+          <Button variant="ghost" size="icon" onClick={logout}>
+            <LogOut className="h-5 w-5" />
+          </Button>
+        </div>
       </header>
 
       <div className="p-4 space-y-4 max-w-md mx-auto">
@@ -87,15 +111,31 @@ const TeacherDashboard = () => {
                   {active.code}
                 </p>
               </div>
+
+              {/* QR Code */}
+              <div className="flex justify-center">
+                <div className="bg-white p-3 rounded-xl">
+                  <QRCodeSVG value={active.code} size={160} />
+                </div>
+              </div>
+
               <div className="text-center">
                 <p className="text-xs text-muted-foreground mb-1">Time Remaining</p>
                 <p className={`text-2xl font-mono font-bold ${remaining < 30000 ? "text-destructive" : "text-foreground"}`}>
                   {formatTime(remaining)}
                 </p>
               </div>
-              <p className="text-center text-xs text-muted-foreground">
-                {getRecordsForSession(active.id).length} student(s) signed
-              </p>
+
+              {/* Live counter */}
+              <div className="flex items-center justify-center gap-2 rounded-lg bg-primary/10 p-2">
+                <Users className="h-4 w-4 text-primary" />
+                <span className="text-lg font-bold text-primary">{liveCount}</span>
+                <span className="text-sm text-muted-foreground">student{liveCount !== 1 && "s"} signed</span>
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary/75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-primary"></span>
+                </span>
+              </div>
             </CardContent>
           </Card>
         ) : (
