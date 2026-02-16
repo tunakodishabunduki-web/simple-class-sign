@@ -1,31 +1,52 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useAuth } from "@/hooks/useAuth";
 import { signAttendance, getRecordsForStudent, getSessions } from "@/lib/storage";
+import { getDeviceFingerprint } from "@/lib/fingerprint";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { LogOut, CheckCircle2, XCircle, History } from "lucide-react";
+import QrScanner from "@/components/QrScanner";
 
 const StudentDashboard = () => {
   const { user, logout } = useAuth();
   const [code, setCode] = useState("");
   const [feedback, setFeedback] = useState<{ type: "success" | "error"; msg: string } | null>(null);
+  const [myRecords, setMyRecords] = useState(user ? getRecordsForStudent(user.id) : []);
+  const sessions = getSessions();
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  // Auto-refresh records every 5 seconds
+  useEffect(() => {
+    if (!user) return;
+    const interval = setInterval(() => {
+      setMyRecords(getRecordsForStudent(user.id));
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [user]);
+
+  const submitCode = (value: string) => {
     if (!user) return;
     setFeedback(null);
     try {
-      signAttendance(code.trim(), user.id, user.name);
+      const fingerprint = getDeviceFingerprint();
+      signAttendance(value.trim(), user.id, user.name, fingerprint);
       setFeedback({ type: "success", msg: "Attendance signed successfully!" });
       setCode("");
+      setMyRecords(getRecordsForStudent(user.id));
     } catch (err: any) {
       setFeedback({ type: "error", msg: err.message });
     }
   };
 
-  const myRecords = user ? getRecordsForStudent(user.id) : [];
-  const sessions = getSessions();
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    submitCode(code);
+  };
+
+  const handleQrScan = (scannedCode: string) => {
+    setCode(scannedCode);
+    submitCode(scannedCode);
+  };
 
   return (
     <div className="min-h-screen bg-background">
@@ -46,7 +67,7 @@ const StudentDashboard = () => {
           <CardHeader className="pb-2">
             <CardTitle className="text-base">Sign Attendance</CardTitle>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-3">
             <form onSubmit={handleSubmit} className="space-y-3">
               <Input
                 value={code}
@@ -61,9 +82,20 @@ const StudentDashboard = () => {
               </Button>
             </form>
 
+            <div className="relative">
+              <div className="absolute inset-0 flex items-center">
+                <span className="w-full border-t" />
+              </div>
+              <div className="relative flex justify-center text-xs uppercase">
+                <span className="bg-card px-2 text-muted-foreground">or</span>
+              </div>
+            </div>
+
+            <QrScanner onScan={handleQrScan} />
+
             {feedback && (
               <div
-                className={`mt-3 flex items-center gap-2 rounded-lg p-3 text-sm font-medium ${
+                className={`flex items-center gap-2 rounded-lg p-3 text-sm font-medium ${
                   feedback.type === "success"
                     ? "bg-[hsl(var(--success)/0.1)] text-[hsl(var(--success))]"
                     : "bg-destructive/10 text-destructive"

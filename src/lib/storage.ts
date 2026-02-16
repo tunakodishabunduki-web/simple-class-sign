@@ -19,6 +19,7 @@ export interface AttendanceRecord {
   studentId: string;
   studentName: string;
   signedAt: number; // timestamp
+  deviceFingerprint?: string;
 }
 
 // Helpers
@@ -77,7 +78,7 @@ export const getActiveSession = (): AttendanceSession | undefined =>
 // Attendance records
 export const getRecords = (): AttendanceRecord[] => get("att_records", []);
 
-export const signAttendance = (code: string, studentId: string, studentName: string): void => {
+export const signAttendance = (code: string, studentId: string, studentName: string, deviceFingerprint?: string): void => {
   const session = getSessions().find((s) => s.code === code);
   if (!session) throw new Error("Invalid attendance code");
   if (session.expiresAt <= Date.now()) throw new Error("This attendance code has expired");
@@ -86,7 +87,15 @@ export const signAttendance = (code: string, studentId: string, studentName: str
   const already = records.find((r) => r.sessionId === session.id && r.studentId === studentId);
   if (already) throw new Error("You already signed this session");
 
-  set("att_records", [...records, { sessionId: session.id, studentId, studentName, signedAt: Date.now() }]);
+  // Check device fingerprint - prevent same device for different students
+  if (deviceFingerprint) {
+    const deviceUsed = records.find(
+      (r) => r.sessionId === session.id && r.deviceFingerprint === deviceFingerprint && r.studentId !== studentId
+    );
+    if (deviceUsed) throw new Error("This device was already used by another student for this session");
+  }
+
+  set("att_records", [...records, { sessionId: session.id, studentId, studentName, signedAt: Date.now(), deviceFingerprint }]);
 };
 
 export const getRecordsForSession = (sessionId: string): AttendanceRecord[] =>
