@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "@/hooks/useAuth";
-import { signAttendance, getRecordsForStudent, getSessions } from "@/lib/storage";
+import { supabase } from "@/integrations/supabase/client";
 import { getDeviceFingerprint } from "@/lib/fingerprint";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,33 +8,107 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { LogOut, CheckCircle2, XCircle, History } from "lucide-react";
 import QrScanner from "@/components/QrScanner";
 
+interface MyRecord {
+  session_id: string;
+  signed_at: string;
+  session_code?: string;
+}
+
 const StudentDashboard = () => {
   const { user, logout } = useAuth();
   const [code, setCode] = useState("");
   const [feedback, setFeedback] = useState<{ type: "success" | "error"; msg: string } | null>(null);
-  const [myRecords, setMyRecords] = useState(user ? getRecordsForStudent(user.id) : []);
-  const sessions = getSessions();
+  const [myRecords, setMyRecords] = useState<MyRecord[]>([]);
+  const [submitting, setSubmitting] = useState(false);
 
-  // Auto-refresh records every 5 seconds
-  useEffect(() => {
+  const fetchRecords = useCallback(async () => {
     if (!user) return;
-    const interval = setInterval(() => {
-      setMyRecords(getRecordsForStudent(user.id));
-    }, 5000);
-    return () => clearInterval(interval);
+    const { data } = await supabase
+      .from("attendance_records")
+      .select("session_id, signed_at")
+      .eq("student_id", user.id)
+      .order("signed_at", { ascending: false });
+
+    if (data && data.length > 0) {
+      const sessionIds = data.map((r: any) => r.session_id);
+      const { data: sessions } = await supabase
+        .from("attendance_sessions")
+        .select("id, code")
+        .in("id", sessionIds);
+
+      const sessionMap = new Map((sessions || []).map((s: any) => [s.id, s.code]));
+      setMyRecords(data.map((r: any) => ({
+        session_id: r.session_id,
+        signed_at: r.signed_at,
+        session_code: sessionMap.get(r.session_id) || "—",
+      })));
+    } else {
+      setMyRecords([]);
+    }
   }, [user]);
 
-  const submitCode = (value: string) => {
-    if (!user) return;
+  useEffect(() => { fetchRecords(); }, [fetchRecords]);
+
+  const submitCode = async (value: string) => {
+    if (!user || submitting) return;
     setFeedback(null);
+    setSubmitting(true);
+
     try {
+      const trimmed = value.trim();
+
+      // Find session by code
+      const { data: session } = await supabase
+        .from("attendance_sessions")
+        .select("id, expires_at")
+        .eq("code", trimmed)
+        .single();
+
+      if (!session) throw new Error("Invalid attendance code");
+      if (new Date((session as any).expires_at) <= new Date()) throw new Error("This attendance code has expired");
+
+      // Check if already signed
+      const { data: existing } = await supabase
+        .from("attendance_records")
+        .select("id")
+        .eq("session_id", (session as any).id)
+        .eq("student_id", user.id)
+        .maybeSingle();
+
+      if (existing) throw new Error("You already signed this session");
+
+      // Check device fingerprint
       const fingerprint = getDeviceFingerprint();
-      signAttendance(value.trim(), user.id, user.name, fingerprint);
+      if (fingerprint) {
+        const { data: deviceUsed } = await supabase
+          .from("attendance_records")
+          .select("id")
+          .eq("session_id", (session as any).id)
+          .eq("device_fingerprint", fingerprint)
+          .neq("student_id", user.id)
+          .maybeSingle();
+
+        if (deviceUsed) throw new Error("This device was already used by another student for this session");
+      }
+
+      const { error } = await supabase
+        .from("attendance_records")
+        .insert({
+          session_id: (session as any).id,
+          student_id: user.id,
+          student_name: user.name,
+          device_fingerprint: fingerprint,
+        });
+
+      if (error) throw new Error(error.message);
+
       setFeedback({ type: "success", msg: "Attendance signed successfully!" });
       setCode("");
-      setMyRecords(getRecordsForStudent(user.id));
+      fetchRecords();
     } catch (err: any) {
       setFeedback({ type: "error", msg: err.message });
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -50,7 +124,6 @@ const StudentDashboard = () => {
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="sticky top-0 z-10 border-b bg-card px-4 py-3 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-bold">Student Dashboard</h1>
@@ -62,7 +135,6 @@ const StudentDashboard = () => {
       </header>
 
       <div className="p-4 space-y-4 max-w-md mx-auto">
-        {/* Sign Attendance */}
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-base">Sign Attendance</CardTitle>
@@ -77,8 +149,8 @@ const StudentDashboard = () => {
                 className="text-center text-2xl font-mono tracking-[0.3em] h-14"
                 required
               />
-              <Button type="submit" className="w-full h-12 text-base">
-                Submit
+              <Button type="submit" className="w-full h-12 text-base" disabled={submitting}>
+                {submitting ? "Submitting..." : "Submit"}
               </Button>
             </form>
 
@@ -97,7 +169,7 @@ const StudentDashboard = () => {
               <div
                 className={`flex items-center gap-2 rounded-lg p-3 text-sm font-medium ${
                   feedback.type === "success"
-                    ? "bg-[hsl(var(--success)/0.1)] text-[hsl(var(--success))]"
+                    ? "bg-primary/10 text-primary"
                     : "bg-destructive/10 text-destructive"
                 }`}
               >
@@ -112,7 +184,6 @@ const StudentDashboard = () => {
           </CardContent>
         </Card>
 
-        {/* Attendance History */}
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-base flex items-center gap-2">
@@ -121,29 +192,18 @@ const StudentDashboard = () => {
           </CardHeader>
           <CardContent>
             {myRecords.length === 0 ? (
-              <p className="text-sm text-muted-foreground py-4 text-center">
-                No attendance records yet.
-              </p>
+              <p className="text-sm text-muted-foreground py-4 text-center">No attendance records yet.</p>
             ) : (
               <ul className="space-y-2">
-                {[...myRecords].reverse().map((r) => {
-                  const session = sessions.find((s) => s.id === r.sessionId);
-                  return (
-                    <li key={r.sessionId} className="flex items-center justify-between rounded-lg border px-3 py-2">
-                      <div>
-                        <p className="text-sm font-medium">
-                          {new Date(r.signedAt).toLocaleDateString()}
-                        </p>
-                        <p className="text-xs text-muted-foreground">
-                          Signed at {new Date(r.signedAt).toLocaleTimeString()}
-                        </p>
-                      </div>
-                      <span className="text-xs text-muted-foreground font-mono">
-                        {session?.code ?? "—"}
-                      </span>
-                    </li>
-                  );
-                })}
+                {myRecords.map((r) => (
+                  <li key={r.session_id} className="flex items-center justify-between rounded-lg border px-3 py-2">
+                    <div>
+                      <p className="text-sm font-medium">{new Date(r.signed_at).toLocaleDateString()}</p>
+                      <p className="text-xs text-muted-foreground">Signed at {new Date(r.signed_at).toLocaleTimeString()}</p>
+                    </div>
+                    <span className="text-xs text-muted-foreground font-mono">{r.session_code}</span>
+                  </li>
+                ))}
               </ul>
             )}
           </CardContent>
