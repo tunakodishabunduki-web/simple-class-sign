@@ -9,22 +9,27 @@ import { ClipboardCheck } from "lucide-react";
 const LoginPage = () => {
   const { login, register } = useAuth();
   const [isRegister, setIsRegister] = useState(false);
-  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"teacher" | "student">("student");
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setLoading(true);
     try {
       if (isRegister) {
-        register(name, password, role);
+        await register(email, password, role, displayName);
       } else {
-        login(name, password);
+        await login(email, password);
       }
     } catch (err: any) {
       setError(err.message);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -42,13 +47,26 @@ const LoginPage = () => {
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
+            {isRegister && (
+              <div className="space-y-2">
+                <Label htmlFor="displayName">Display Name</Label>
+                <Input
+                  id="displayName"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  placeholder="Your name"
+                  required
+                />
+              </div>
+            )}
             <div className="space-y-2">
-              <Label htmlFor="name">Name</Label>
+              <Label htmlFor="email">Email</Label>
               <Input
-                id="name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Your name"
+                id="email"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@example.com"
                 required
               />
             </div>
@@ -61,6 +79,7 @@ const LoginPage = () => {
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="Password"
                 required
+                minLength={6}
               />
             </div>
 
@@ -92,8 +111,8 @@ const LoginPage = () => {
               <p className="text-sm text-destructive font-medium">{error}</p>
             )}
 
-            <Button type="submit" className="w-full text-base h-11">
-              {isRegister ? "Create Account" : "Sign In"}
+            <Button type="submit" className="w-full text-base h-11" disabled={loading}>
+              {loading ? "Please wait..." : isRegister ? "Create Account" : "Sign In"}
             </Button>
 
             <p className="text-center text-sm text-muted-foreground">

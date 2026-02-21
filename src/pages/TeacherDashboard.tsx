@@ -1,17 +1,26 @@
 import { useState, useEffect, useCallback } from "react";
 import { useAuth } from "@/hooks/useAuth";
-import {
-  createSession,
-  getActiveSession,
-  getSessions,
-  getRecordsForSession,
-  type AttendanceSession,
-} from "@/lib/storage";
-import { exportSessionsToCSV } from "@/lib/csv";
+import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { LogOut, Plus, Clock, Users, ChevronRight, Download } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
+
+interface Session {
+  id: string;
+  code: string;
+  created_at: string;
+  expires_at: string;
+  teacher_id: string;
+}
+
+interface Record {
+  id: string;
+  session_id: string;
+  student_id: string;
+  student_name: string;
+  signed_at: string;
+}
 
 const formatTime = (ms: number) => {
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -20,73 +29,160 @@ const formatTime = (ms: number) => {
   return `${m}:${sec.toString().padStart(2, "0")}`;
 };
 
+const generateCode = (): string =>
+  String(Math.floor(100000 + Math.random() * 900000));
+
 const TeacherDashboard = () => {
   const { user, logout } = useAuth();
-  const [active, setActive] = useState<AttendanceSession | undefined>(getActiveSession());
+  const [active, setActive] = useState<Session | null>(null);
   const [remaining, setRemaining] = useState(0);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
-  const [sessions, setSessions] = useState(getSessions());
+  const [sessions, setSessions] = useState<Session[]>([]);
   const [liveCount, setLiveCount] = useState(0);
+  const [selectedRecords, setSelectedRecords] = useState<Record[]>([]);
 
-  const refresh = useCallback(() => {
-    const a = getActiveSession();
-    setActive(a);
-    setSessions(getSessions());
-    if (a) {
-      setRemaining(a.expiresAt - Date.now());
-      setLiveCount(getRecordsForSession(a.id).length);
+  const fetchSessions = useCallback(async () => {
+    if (!user) return;
+    const { data } = await supabase
+      .from("attendance_sessions")
+      .select("*")
+      .eq("teacher_id", user.id)
+      .order("created_at", { ascending: false });
+    if (data) {
+      setSessions(data as Session[]);
+      const now = new Date().toISOString();
+      const activeSession = (data as Session[]).find(s => s.expires_at > now);
+      setActive(activeSession || null);
     }
-  }, []);
+  }, [user]);
 
-  // Auto-refresh every 2 seconds for live counter + session list
+  const fetchLiveCount = useCallback(async () => {
+    if (!active) return;
+    const { count } = await supabase
+      .from("attendance_records")
+      .select("*", { count: "exact", head: true })
+      .eq("session_id", active.id);
+    setLiveCount(count || 0);
+  }, [active]);
+
+  useEffect(() => { fetchSessions(); }, [fetchSessions]);
+
+  // Poll for live count
   useEffect(() => {
-    const interval = setInterval(refresh, 2000);
+    if (!active) return;
+    fetchLiveCount();
+    const interval = setInterval(fetchLiveCount, 2000);
     return () => clearInterval(interval);
-  }, [refresh]);
+  }, [active, fetchLiveCount]);
 
+  // Realtime subscription for instant updates
+  useEffect(() => {
+    if (!active) return;
+    const channel = supabase
+      .channel(`records-${active.id}`)
+      .on("postgres_changes", {
+        event: "INSERT",
+        schema: "public",
+        table: "attendance_records",
+        filter: `session_id=eq.${active.id}`,
+      }, () => {
+        fetchLiveCount();
+      })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [active, fetchLiveCount]);
+
+  // Countdown timer
   useEffect(() => {
     if (!active) return;
     const interval = setInterval(() => {
-      const r = active.expiresAt - Date.now();
+      const r = new Date(active.expires_at).getTime() - Date.now();
       if (r <= 0) {
         setRemaining(0);
-        setActive(undefined);
-        setSessions(getSessions());
+        setActive(null);
+        fetchSessions();
       } else {
         setRemaining(r);
-        setLiveCount(getRecordsForSession(active.id).length);
       }
     }, 500);
     return () => clearInterval(interval);
-  }, [active]);
+  }, [active, fetchSessions]);
 
-  const startSession = (minutes: number) => {
+  const startSession = async (minutes: number) => {
     if (!user) return;
-    const s = createSession(user.id, minutes);
-    setActive(s);
-    setRemaining(s.expiresAt - Date.now());
-    setLiveCount(0);
-    setSessions(getSessions());
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + minutes * 60 * 1000);
+    const code = generateCode();
+
+    const { data, error } = await supabase
+      .from("attendance_sessions")
+      .insert({
+        code,
+        expires_at: expiresAt.toISOString(),
+        teacher_id: user.id,
+      })
+      .select()
+      .single();
+
+    if (data && !error) {
+      setActive(data as Session);
+      setRemaining(minutes * 60 * 1000);
+      setLiveCount(0);
+      fetchSessions();
+    }
   };
 
-  const selectedRecords = selectedSession ? getRecordsForSession(selectedSession) : [];
-  const selectedSessionData = selectedSession ? sessions.find((s) => s.id === selectedSession) : null;
+  const fetchSelectedRecords = useCallback(async (sessionId: string) => {
+    const { data } = await supabase
+      .from("attendance_records")
+      .select("*")
+      .eq("session_id", sessionId)
+      .order("signed_at", { ascending: true });
+    setSelectedRecords((data as Record[]) || []);
+  }, []);
+
+  useEffect(() => {
+    if (selectedSession) fetchSelectedRecords(selectedSession);
+  }, [selectedSession, fetchSelectedRecords]);
+
+  const exportCSV = async () => {
+    // Fetch all records for all sessions
+    const sessionIds = sessions.map(s => s.id);
+    if (sessionIds.length === 0) return;
+
+    const { data: records } = await supabase
+      .from("attendance_records")
+      .select("*")
+      .in("session_id", sessionIds);
+
+    if (!records || records.length === 0) return;
+
+    const header = "Session Date,Session Code,Student Name,Signed At\n";
+    const rows = (records as Record[]).map(r => {
+      const session = sessions.find(s => s.id === r.session_id);
+      return `"${session ? new Date(session.created_at).toLocaleString() : ""}","${session?.code || ""}","${r.student_name}","${new Date(r.signed_at).toLocaleString()}"`;
+    }).join("\n");
+
+    const blob = new Blob([header + rows], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `attendance_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const selectedSessionData = selectedSession ? sessions.find(s => s.id === selectedSession) : null;
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="sticky top-0 z-10 border-b bg-card px-4 py-3 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-bold">Teacher Dashboard</h1>
           <p className="text-xs text-muted-foreground">Hi, {user?.name}</p>
         </div>
         <div className="flex gap-1">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => exportSessionsToCSV(sessions, getRecordsForSession)}
-            title="Export CSV"
-          >
+          <Button variant="ghost" size="icon" onClick={exportCSV} title="Export CSV">
             <Download className="h-5 w-5" />
           </Button>
           <Button variant="ghost" size="icon" onClick={logout}>
@@ -96,7 +192,6 @@ const TeacherDashboard = () => {
       </header>
 
       <div className="p-4 space-y-4 max-w-md mx-auto">
-        {/* Active Session */}
         {active ? (
           <Card className="border-primary/30 bg-primary/5">
             <CardHeader className="pb-2">
@@ -111,22 +206,17 @@ const TeacherDashboard = () => {
                   {active.code}
                 </p>
               </div>
-
-              {/* QR Code */}
               <div className="flex justify-center">
                 <div className="bg-white p-3 rounded-xl">
                   <QRCodeSVG value={active.code} size={160} />
                 </div>
               </div>
-
               <div className="text-center">
                 <p className="text-xs text-muted-foreground mb-1">Time Remaining</p>
                 <p className={`text-2xl font-mono font-bold ${remaining < 30000 ? "text-destructive" : "text-foreground"}`}>
                   {formatTime(remaining)}
                 </p>
               </div>
-
-              {/* Live counter */}
               <div className="flex items-center justify-center gap-2 rounded-lg bg-primary/10 p-2">
                 <Users className="h-4 w-4 text-primary" />
                 <span className="text-lg font-bold text-primary">{liveCount}</span>
@@ -158,18 +248,15 @@ const TeacherDashboard = () => {
           </Card>
         )}
 
-        {/* Session Detail View */}
         {selectedSession && selectedSessionData ? (
           <Card>
             <CardHeader className="pb-2">
               <div className="flex items-center justify-between">
                 <CardTitle className="text-base">Session Details</CardTitle>
-                <Button variant="ghost" size="sm" onClick={() => setSelectedSession(null)}>
-                  Back
-                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setSelectedSession(null)}>Back</Button>
               </div>
               <p className="text-xs text-muted-foreground">
-                {new Date(selectedSessionData.createdAt).toLocaleString()} · Code: {selectedSessionData.code}
+                {new Date(selectedSessionData.created_at).toLocaleString()} · Code: {selectedSessionData.code}
               </p>
             </CardHeader>
             <CardContent>
@@ -178,11 +265,9 @@ const TeacherDashboard = () => {
               ) : (
                 <ul className="space-y-2">
                   {selectedRecords.map((r) => (
-                    <li key={r.studentId} className="flex items-center justify-between rounded-lg border px-3 py-2">
-                      <span className="font-medium text-sm">{r.studentName}</span>
-                      <span className="text-xs text-muted-foreground">
-                        {new Date(r.signedAt).toLocaleTimeString()}
-                      </span>
+                    <li key={r.student_id} className="flex items-center justify-between rounded-lg border px-3 py-2">
+                      <span className="font-medium text-sm">{r.student_name}</span>
+                      <span className="text-xs text-muted-foreground">{new Date(r.signed_at).toLocaleTimeString()}</span>
                     </li>
                   ))}
                 </ul>
@@ -190,7 +275,6 @@ const TeacherDashboard = () => {
             </CardContent>
           </Card>
         ) : (
-          /* Session History */
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-base flex items-center gap-2">
@@ -202,9 +286,8 @@ const TeacherDashboard = () => {
                 <p className="text-sm text-muted-foreground py-4 text-center">No sessions yet.</p>
               ) : (
                 <ul className="space-y-2">
-                  {[...sessions].reverse().map((s) => {
-                    const count = getRecordsForSession(s.id).length;
-                    const expired = s.expiresAt <= Date.now();
+                  {sessions.map((s) => {
+                    const expired = new Date(s.expires_at) <= new Date();
                     return (
                       <li
                         key={s.id}
@@ -213,14 +296,10 @@ const TeacherDashboard = () => {
                       >
                         <div>
                           <p className="text-sm font-medium">
-                            {new Date(s.createdAt).toLocaleDateString()}{" "}
-                            <span className="text-muted-foreground font-normal">
-                              {new Date(s.createdAt).toLocaleTimeString()}
-                            </span>
+                            {new Date(s.created_at).toLocaleDateString()}{" "}
+                            <span className="text-muted-foreground font-normal">{new Date(s.created_at).toLocaleTimeString()}</span>
                           </p>
-                          <p className="text-xs text-muted-foreground">
-                            {count} student{count !== 1 && "s"} · {expired ? "Expired" : "Active"}
-                          </p>
+                          <p className="text-xs text-muted-foreground">{expired ? "Expired" : "Active"}</p>
                         </div>
                         <ChevronRight className="h-4 w-4 text-muted-foreground" />
                       </li>
